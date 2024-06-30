@@ -1,0 +1,712 @@
+---
+title: "Metagenome and 16S Workflow"
+author: "Rachel Mackelprang and Ashwana Fricker"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+
+## Load Libraries and select theming
+```{r}
+#load libraries
+library(qiime2R) #import qiime dataset into phyloseq object
+library(tidyverse) #part of phyloseq?
+library(data.table) #rbindlist
+library(tidyr) #collapse GHs
+library(ggplot2) #part of phyloseq?
+library(vegan) 
+library(phyloseq) #using phyloseq objects
+#library(readxl) #read in excel files
+library(DESeq2) #RNA stats package
+#library(EnhancedVolcano) #Graph volcano plots #need proj4 to load
+library(scales) 
+library(viridis) #Color gplots
+library(pheatmap)
+#library(ALDEx2)
+library(ANCOMBC)
+library(caret)
+library(DT)
+#library(prob)
+library(ecodist) #running MRM to compare matrices
+library(broom) #running Spearman correlation - tidy
+library(here) #set working directory
+
+#some ggplot2 theming
+theme_set(theme_bw()) 
+
+```
+
+## Import data and create a phyloseq object
+```{r}
+#Set input directories
+input_taxa <- here("Data", "QiimeOut_5_24_2023_Miseq_decontam_prev_mito_chlor_core_metrics") 
+input_meta <- here("Data","Metadata")
+input_gene <- here("Data","GeneCounts")
+input_milk <- here("Data","MilkData")
+
+#import metadata and remove rows that are only NA
+meta<-read_tsv(paste(input_meta,"MilkBabies_Map_4.txt", sep="/"))
+meta.normal<-read_tsv(paste(input_meta,"MilkBabies_Map_4_normalized.txt", sep="/"))
+meta.normal <- meta.normal[rowSums(is.na(meta.normal)) != ncol(meta.normal), ]
+meta.normal <- meta.normal[,colSums(is.na(meta.normal))<nrow(meta.normal)]
+
+#change anything of type 'chr' to a factor. Make the first column into row names
+meta<-meta %>% as.data.frame() %>% 
+ mutate_if(sapply(meta, is.character), as.factor) %>% 
+ column_to_rownames('SampleID')
+
+meta.normal<-meta.normal %>% as.data.frame() %>% 
+ mutate_if(sapply(meta.normal, is.character), as.factor) %>% 
+ column_to_rownames('SampleID')
+
+#THIS IS THE TOGGLE: Use meta or meta.normal depending on analysis type
+SDATA<-sample_data(meta)
+
+#Import 16S data
+otu.physeq<-qza_to_phyloseq(
+    features=paste(input_taxa,"5_24_2023_Miseq_decontam_prev_mito_chlor_table.qza", sep = "/"),
+    tree=paste(input_taxa,"5_24_2023_Miseq_rep_seqs_rooted_tree.qza",sep = "/"),
+    paste(input_taxa,"5_24_2023_Miseq_taxonomy.qza",sep = "/"),
+    metadata = paste(input_meta,"MilkBabies_Map_3.txt",sep = "/"))
+
+
+#import cazyme counts
+cazy.counts<-read_csv(paste(input_gene,"cazy_counts.csv", sep = "/")) %>% as.data.frame() %>% column_to_rownames("cazy")
+
+#import HMO data
+HMO.nM.Fore<-read_csv(paste(input_milk,"MilkBabies_HMO_nM_Fore.csv", sep="/")) %>% as.data.frame() %>% column_to_rownames("SampleID")
+HMO.nM.Hind<-read_csv(paste(input_milk,"MilkBabies_HMO_nM_Hind.csv", sep="/")) %>% as.data.frame() %>% column_to_rownames("SampleID")
+HMO.ug.Fore<-read_csv(paste(input_milk,"MilkBabies_HMO_ug_Fore.csv", sep="/")) %>% as.data.frame() %>% column_to_rownames("SampleID")
+HMO.ug.Hind<-read_csv(paste(input_milk,"MilkBabies_HMO_ug_Hind.csv", sep="/")) %>% as.data.frame() %>% column_to_rownames("SampleID")
+
+#create phyloseq object to perform filtering and change to relative abundance
+GH<-otu_table(cazy.counts, taxa_are_rows=TRUE)
+cazy.physeq<-phyloseq(GH,SDATA)
+
+#Filter low abundance genes and ASVs (observed fewer than 50 times - arbitrary).
+cazy.physeq.f<-prune_taxa(taxa_sums(cazy.physeq) > 50, cazy.physeq)
+otu.physeq.f<-prune_taxa(taxa_sums(otu.physeq) > 50, otu.physeq)
+```
+
+## Preprocess Data: 
+#### Rarefy
+```{r}
+## Rarefy instead of normalize
+#I used to be in camp "Waste Not, Want Not: Why Rarefying Microbiome Data Is Inadmissible" but I was convinced by Pat Schloss that rarefaction is the way to go. https://www.youtube.com/watch?v=t5qXPIS-ECU&list=PLmNrK_nkqBpJuhS93PYC-Xr5oqur7IIWf&index=2
+
+cazy.physeq.rare<-rarefy_even_depth(cazy.physeq.f, rngseed=42)
+otu.physeq.rare<-rarefy_even_depth(otu.physeq.f, rngseed=42)
+
+#extract counts from phyloseq object and transform matrix
+cazy.rare.counts<-as.data.frame(t(otu_table(cazy.physeq.rare)))
+otu.rare.counts<-as.data.frame(t(otu_table(otu.physeq.rare)))
+```
+
+#### Select GH genes from rarefied data
+```{r}
+#Select GH genes from rarefied dataset. Remove GH0
+GHgenes<-taxa_names(physeq_rare)
+GHgenes<-GHgenes[!grepl("AA|CBM|GT|CE|PL", GHgenes)]
+physeq_rare_gh<-prune_taxa(GHgenes, physeq_rare)
+
+badGenes<-c("GH0")
+goodGenes<-setdiff(taxa_names(physeq_rare_gh), badGenes)
+physeq_rare_gh<-prune_taxa(goodGenes, physeq_rare_gh)
+
+```
+
+#### Select GH genes from raw count data
+```{r}
+#Select GH genes from raw counts. Remove GH0
+GHgenes_raw<-taxa_names(cazy.physeq.f)
+GHgenes_raw<-GHgenes_raw[!grepl("AA|CBM|GT|CE|PL", GHgenes_raw)]
+physeq_raw_gh<-prune_taxa(GHgenes_raw, cazy.physeq.f)
+
+badGenes<-c("GH0")
+goodGenes<-setdiff(taxa_names(physeq_raw_gh), badGenes)
+physeq_raw_gh<-prune_taxa(goodGenes, physeq_raw_gh)
+```
+
+#### Collapse GH genes and select from rarefied data
+```{r}
+
+GHgenes<-taxa_names(physeq_rare) #get all column names
+GHgenes <- grep("^[^GH]*GH[^GH]*$", GHgenes, value=TRUE) #find GH only once **this is important!**
+physeq_CBM_GH<-prune_taxa(GHgenes, physeq_rare) #Extract data
+physeq_CBM_GH.df<-as.data.frame(otu_table(physeq_CBM_GH)) #Make a data frame
+
+GHgenes<-data.frame(GHgenes) #Make a data frame
+colnames(GHgenes) <-"Cazymes" #Set first column name
+GHgenes<-separate_rows(GHgenes, Cazymes, sep='\\|') #create one long list
+GHgenes <- distinct(GHgenes[grep("GH", GHgenes$Cazymes), ]) #find unique values
+
+physeq_GH_all.df<-physeq_CBM_GH.df %>% 
+  rownames_to_column('Cazymes') %>% #Make first column the rownames, call it "cazymes"
+  separate_rows(., Cazymes, sep='\\|') %>% #Split column based on pipe operator
+  group_by(Cazymes) %>% #Group by the first column (all that match)
+  summarise_each(list(sum)) #Sum all rows that have the same matching column
+
+physeq_GH_all.df<-as.data.frame(physeq_GH_all.df[!grepl("CBM|GH0|CE", physeq_GH_all.df$Cazymes),]) #Remove al CBM, CE, and GH0
+row.names(physeq_GH_all.df) <- physeq_GH_all.df$Cazymes
+physeq_GH_all.df <- physeq_GH_all.df[,-1]
+
+GHs<-otu_table(physeq_GH_all.df, taxa_are_rows=TRUE)
+GHs.physeq<-phyloseq(GHs,SDATA)
+```
+
+#### Collapse GH genes and select from raw data
+```{r}
+
+GHgenes_raw <- taxa_names(cazy.physeq.f) #get all column names
+GHgenes_raw <- grep("^[^GH]*GH[^GH]*$", GHgenes_raw, value=TRUE) #find GH only once **this is important!**
+physeq_CBM_GH_raw <- prune_taxa(GHgenes_raw, cazy.physeq.f) #Extract data
+physeq_CBM_GH_raw.df <-as.data.frame(otu_table(physeq_CBM_GH_raw)) #Make a data frame
+
+GHgenes_raw <- data.frame(GHgenes_raw) #Make a data frame
+colnames(GHgenes_raw) <- "Cazymes" #Set first column name
+GHgenes_raw <- separate_rows(GHgenes_raw, Cazymes, sep='\\|') #create one long list
+GHgenes_raw <- distinct(GHgenes_raw[grep("GH", GHgenes_raw$Cazymes), ]) #find unique values
+
+physeq_GH_raw_all.df<-physeq_CBM_GH_raw.df %>% 
+  rownames_to_column('Cazymes') %>% #Make first column the rownames, call it "cazymes"
+  separate_rows(., Cazymes, sep='\\|') %>% #Split column based on pipe operator
+  group_by(Cazymes) %>% #Group by the first column (all that match)
+  summarise_each(list(sum)) #Sum all rows that have the same matching column
+
+physeq_GH_raw_all.df <- as.data.frame(physeq_GH_raw_all.df[!grepl("CBM|GH0|CE", physeq_GH_raw_all.df$Cazymes),]) #Remove al CBM, CE, and GH0
+row.names(physeq_GH_raw_all.df) <- physeq_GH_raw_all.df$Cazymes
+physeq_GH_raw_all.df <- physeq_GH_raw_all.df[,-1]
+
+GHs_raw<-otu_table(physeq_GH_raw_all.df, taxa_are_rows=TRUE)
+GHs_raw.physeq<-phyloseq(GHs_raw,SDATA)
+```
+
+#### Average HMO data
+```{r}
+HMO.nM.Fore$sample<-rownames(HMO.nM.Fore)
+HMO.nM.Hind$sample<-rownames(HMO.nM.Hind)
+HMO.ug.Fore$sample<-rownames(HMO.ug.Fore)
+HMO.ug.Hind$sample<-rownames(HMO.ug.Hind)
+HMO.nM.Average <- data.frame(rbindlist(list(HMO.nM.Fore,HMO.nM.Hind))[,lapply(.SD,mean), list(sample)])
+HMO.ug.Average <- data.frame(rbindlist(list(HMO.ug.Fore,HMO.ug.Hind))[,lapply(.SD,mean), list(sample)])
+
+row.names(HMO.nM.Average)<-HMO.nM.Average$sample
+row.names(HMO.ug.Average)<-HMO.ug.Average$sample
+
+HMO.nM.Average<-HMO.nM.Average[,-1]
+HMO.ug.Average<-HMO.ug.Average[,-1]
+HMO.nM.Fore <- subset(HMO.nM.Fore, select = -sample)
+HMO.nM.Hind <- subset(HMO.nM.Hind, select = -sample)
+HMO.ug.Fore <- subset(HMO.ug.Fore, select = -sample)
+HMO.ug.Hind <- subset(HMO.ug.Hind, select = -sample)
+```
+
+
+## All data: overview
+#### Heatmap
+```{r}
+#The purpose of this heatmap is to take a quick look at the overall picture
+
+#set up colors
+colfunc <- colorRampPalette(c("white", "snow", "#ccffcc", "dodgerblue","blue", "mediumblue"))
+hmcol<-colfunc(50)
+
+#filter low abundance genes (observed fewer than 1000 times)
+physeq.rare.f1000<-prune_taxa(taxa_sums(physeq_rare_gh) > 1000, physeq_rare_gh)
+rare.f1000.df<-as.data.frame(t(otu_table(physeq.rare.f1000)))
+
+pheatmap(rare.f1000.df, scale="column", color=hmcol, cluster_cols=T, clustering_distance_cols = "correlation", clustering_method="complete", clustering_distance_rows="correlation")
+
+# pdf(file="/Users/africker/Desktop/Baby_Microbes_5_24_23/cazyme_heatmap.pdf", useDingbats = F, width=50, height=20)
+# pheatmap(rare.f1000.df, scale="column", color=hmcol, cluster_cols=T, clustering_distance_cols = "correlation", clustering_method="complete", clustering_distance_rows="correlation")
+# dev.off()
+
+```
+
+#### Ordinations
+```{r}
+#Subset samples of interest
+types_to_keep<-c("ob.ov")
+physeq_rare_ob_ov_nw<-subset_samples(GHs.physeq, BMI.two %in% types_to_keep)
+
+#remove cazymes that aren't seen more than 50 times in at least 10% of the samples. 
+physeq_rare_ob_ov_nw<-filter_taxa(physeq_rare_ob_ov_nw, function(x) sum(x>50) > (0.1*length(x)), TRUE)
+
+#get the sample names so we can label the ordination plot
+sample_data(physeq_rare_ob_ov_nw)['sample_id']<-row.names(sample_data(physeq_rare_ob_ov_nw))
+
+#ordinate (bray curtis)
+set.seed(42)
+ord_bray_rare_ob_ov_nw.nmds<-ordinate(physeq_rare_ob_ov_nw, "NMDS", "bray")
+
+#set up the plot
+colors = c("#FC4E07","#E7B800","#00AFBB" )
+p=plot_ordination(physeq_rare_ob_ov_nw, ord_bray_rare_ob_ov_nw.nmds, color = "Mode.of.Delivery", shape = "Infantsex", label="sample_id")
+
+#save plot to file
+
+#pdf(file="/Users/africker/Desktop/Baby_Microbes_5_24_23/cazyme_ordinations.pdf", useDingbats = F, height = 3, width=5)
+#p+geom_point(size=4, alpha=0.75) + ggtitle("CAZy OB, OW, NW Samples") + scale_color_manual(values=colors)+theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank())
+#dev.off()
+
+#print plot to screen
+p+geom_point(size=4, alpha=0.75) + ggtitle("CAZy") + scale_color_viridis_d()+theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank())
+```
+
+#### PERMANOVA
+```{r}
+#NOTE: I like to be able to run the different sections of this notebook independently. So even though I performed a similarsample selection in the previous section, I regenerated it here.  
+
+#Select the samples to keep
+types_to_keep<-c("Y")
+physeq_rare_ob_ov_nw<-subset_samples(GHs.physeq, Secretor %in% types_to_keep)
+
+#remove cazymes that aren't seen more than 50 times in at least 10% of the samples. 
+physeq_rare_ob_ov_nw<-filter_taxa(physeq_rare_ob_ov_nw, function(x) sum(x>50) > (0.1*length(x)), TRUE)
+
+#extract counts from phyloseq object
+counts_rare_ob_ov_nw<-as.data.frame(t(otu_table(physeq_rare_ob_ov_nw)))
+
+#extract samples from metadata table
+#Find the overlapping samples and get just the overlapping samples.
+common.ids<-intersect(rownames(meta), 
+rownames(counts_rare_ob_ov_nw))
+meta_ob_ov_nw<-meta[common.ids,]
+
+#This extra line makes sure the samples are in the order in the metadata table and the and cazy count table. If you don't do this, your permanova results won't be valid. 
+counts_rare_ob_ov_nw<-counts_rare_ob_ov_nw[common.ids,]
+
+#R can hold on to extra levels within factors, even if the samples having those levels have all been filtered away. This fixes that issue
+meta_ob_ov_nw<-droplevels(meta_ob_ov_nw)
+
+##PERMANOVA
+set.seed(42)
+
+#Run distance matrix
+bray.counts_rare_ob_ov_nw<-vegdist(counts_rare_ob_ov_nw, "bray")
+
+#Run the PERMANOVA (adonis2)
+adonis2(formula=bray.counts_rare_ob_ov_nw ~ Mode.of.Delivery, data = meta_ob_ov_nw, permutations = 9999)
+
+
+##Iterate PERMANOVA through entire mapping file
+meta_ob_ov_nw_2cols <- names(which(lengths(lapply(meta_ob_ov_nw, \(x) unique(x[!is.na(x)]))) >= 2)) #Get column headers
+meta_ob_ov_nw_2fact<-meta_ob_ov_nw[,meta_ob_ov_nw_2cols] #Select all columns with at least two groups
+
+results<-list() #Create empty list
+for (i in colnames(meta_ob_ov_nw_2fact)){ 
+  form <- as.formula(paste("bray.counts_rare_ob_ov_nw", i, sep="~"))
+  results[[i]]<- adonis2(form, data= meta_ob_ov_nw_2fact, permutations=9999)
+} #loop to iterate over columns in metadata table and calculate adonis
+results
+
+# capture.output(results, file = "/Users/africker/Desktop/Baby_Microbes_5_24_23/Illumina DNA Reads/BabyMicrobes_GHs_Secretor_ADONIS_v1.txt") #Write data to file
+```
+
+#### Alpha diversity
+```{r}
+types_to_keep<-c("Y")
+physeq_rare_ob_ov_nw<-subset_samples(GHs.physeq, Secretor %in% types_to_keep)
+
+#remove cazymes that aren't seen more than 50 times in at least 10% of the samples. 
+physeq_rare_ob_ov_nw<-filter_taxa(physeq_rare_ob_ov_nw, function(x) sum(x>50) > (0.1*length(x)), TRUE)
+
+colors = c("#FC4E07","#E7B800","#00AFBB" )
+
+#Plot alpha diversity metrics
+p = plot_richness(physeq_rare_ob_ov_nw, x = "Infantsex", measures = c("Observed", "InvSimpson", "Shannon"))
+p + 
+  xlab("Infantsex") + 
+  ylab(NULL) + 
+  geom_boxplot() + 
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank())  + 
+  scale_fill_manual(values = colors) + 
+  theme(legend.position = "none", strip.background = element_rect(fill="white"))
+
+#Set up data for significance tests. 
+
+alpha_rare_ob_ov_nw<-estimate_richness(physeq_rare_ob_ov_nw, measures=c("Observed","Shannon", "InvSimpson"))
+
+alpha_rare_ob_ov_nw_for_anova<-cbind(sample_data(physeq_rare_ob_ov_nw), alpha_rare_ob_ov_nw)
+
+#Anova
+shannon_rare_ob_ov_nw.aov<-aov(Shannon~Infantsex, alpha_rare_ob_ov_nw_for_anova)
+summary(shannon_rare_ob_ov_nw.aov)
+
+invsimp_rare_ob_ov_nw.aov<-aov(InvSimpson~Infantsex, alpha_rare_ob_ov_nw_for_anova)
+summary(invsimp_rare_ob_ov_nw.aov)
+
+observed_rare_ob_ov_nw.aov<-aov(Observed~Infantsex, alpha_rare_ob_ov_nw_for_anova)
+summary(observed_rare_ob_ov_nw.aov)
+
+#Posthoc tests
+tukey_shannon_rare_ob_ov_nw<-TukeyHSD(shannon_rare_ob_ov_nw.aov)
+tukey_shannon_rare_ob_ov_nw
+
+tukey_invsimp_rare_ob_ov_nw<-TukeyHSD(invsimp_rare_ob_ov_nw.aov)
+tukey_invsimp_rare_ob_ov_nw
+
+tukey_observed_rare_ob_ov_nw<-TukeyHSD(observed_rare_ob_ov_nw.aov)
+tukey_observed_rare_ob_ov_nw
+
+```
+
+#### Permdisp
+```{r}
+#Cis and trans samples
+types_to_keep<-c("Y")
+physeq_rare_ob_ov_nw<-subset_samples(GHs.physeq, Secretor %in% types_to_keep)
+
+#remove cazymes that aren't seen more than 50 times in at least 10% of the samples. 
+physeq_rare_ob_ov_nw<-filter_taxa(physeq_rare_ob_ov_nw, function(x) sum(x>50) > (0.1*length(x)), TRUE)
+
+#extract the counts from the phyloseq object
+counts_rare_ob_ov_nw<-as.data.frame(t(otu_table(physeq_rare_ob_ov_nw)))
+
+#Extract samples from metadata
+#Find the overlapping samples and get just the overlapping samples.
+common.ids<-intersect(rownames(meta), 
+rownames(counts_rare_ob_ov_nw))
+meta_ob_ov_nw<-meta[common.ids,]
+counts_rare_ob_ov_nw<-counts_rare_ob_ov_nw[common.ids,]
+
+#R can hold on to extra levels within factors, even if the samples having those levels have all been filtered away. This fixes that issue
+meta_ob_ov_nw<-droplevels(meta_ob_ov_nw)
+
+#bray-curtis distances
+bray.rare_ob_ov_nw<-vegdist(counts_rare_ob_ov_nw, "bray")
+
+#betadispersion
+betadisp_rare_ob_ov_nw<-betadisper(bray.rare_ob_ov_nw, meta_ob_ov_nw$BMI.two, type="centroid")
+
+#plot betadispersion
+plot(betadisp_rare_ob_ov_nw)
+
+#significance tests
+anova(betadisp_rare_ob_ov_nw)
+TukeyHSD(betadisp_rare_ob_ov_nw)
+
+#Set up the boxplot
+colors = c("#FC4E07","#E7B800","#00AFBB" )
+bdisp <- data.frame(group=betadisp_rare_ob_ov_nw$group, distances = betadisp_rare_ob_ov_nw$distances)
+
+#Graph boxplot
+p = ggplot(bdisp, aes(x = group, y = distances, fill = group)) + geom_boxplot()
+p + 
+  scale_fill_manual(values=colors) + 
+  geom_jitter(shape = 16, position = position_jitter(0.1)) + 
+  theme(panel.grid.major=element_blank(), 
+        panel.grid.minor = element_blank(), 
+        legend.position = "none", 
+        axis.text=element_text(size=12), 
+        axis.title=element_text(size=15),
+        axis.title.x = element_blank()) + 
+  ylab("Distance to centroid") + ggtitle("CAZy")
+
+#Save boxplot to file
+#pdf(file="/Users/africker/Desktop/Baby_Microbes_5_24_23/cazyme_betadisp_boxplots.pdf", useDingbats = F, height = 5, width =3)
+#p+scale_fill_manual(values=colors)+geom_jitter(shape=16, position=position_jitter(0.1))+theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(), legend.position = "none") + theme(axis.title.x = element_blank())+ylab("Distance to centroid")+ggtitle("CAZy rRNA amplicon Two Month")+theme(axis.text=element_text(size=12))+theme(axis.title=element_text(size=15))
+#dev.off()
+```
+
+## Hypothesis Testing
+#### deseq2
+```{r}
+#deseq2 has it's own internal means of normalization, so use raw count data rather than rarefied data. 
+
+#Select samples of interest
+types_to_keep<-c("Y")
+physeq_GH_ob_ov_nw<-subset_samples(GHs_raw.physeq, Secretor %in% types_to_keep)
+
+#remove cazymes that aren't seen more than 50 times in at least 10% of the samples. 
+physeq_GH_ob_ov_nw<-filter_taxa(physeq_GH_ob_ov_nw, function(x) sum(x>50) > (0.1*length(x)), TRUE)
+
+#extract count data. 
+counts_GH_ob_ov_nw<-as.data.frame(otu_table(physeq_GH_ob_ov_nw))
+
+#It is important to ensure your kegg table and metadata table samples IDs are lined up correctly. 
+#Find the overlapping samples and get just the overlapping samples.
+common.ids<-intersect(rownames(meta), colnames(counts_GH_ob_ov_nw))
+counts_GH_ob_ov_nw<-counts_GH_ob_ov_nw[,common.ids]
+meta_GH_ob_ov_nw<-meta[common.ids,]
+
+#Run DESeq
+dds<-DESeqDataSetFromMatrix(countData = counts_GH_ob_ov_nw, colData = meta_GH_ob_ov_nw, design= ~ Milk.fat.category)
+dds<-DESeq(dds)
+dds_res<-results(dds)
+
+#write.table(as.data.frame(dds_res), file="/Users/africker/Desktop/Baby_Microbes_5_24_23/cazyme_deseq2.txt", sep = ",")
+
+### Make heatmap
+
+#coerce deseq2 results to a dataframe
+dds_ob_ov_nw_GH_DF<-as.data.frame(dds_res)
+
+#Gets a list of all sig genes at p < 0.05 and log2fold change > 1
+ob_ov_nw_GH_sigGenes_list<-rownames(dds_ob_ov_nw_GH_DF[dds_ob_ov_nw_GH_DF$padj <= 0.05 & abs(dds_ob_ov_nw_GH_DF$log2FoldChange) > 1,])
+
+#Extracts counts from rarefied phyloseq object and gets sig genes
+physeq_rare_GH_ob_ov_nw<-subset_samples(GHs.physeq,  Secretor %in% types_to_keep)
+counts_rare_GH<-as.data.frame(otu_table(physeq_rare_GH_ob_ov_nw))
+ob_ov_nw_GH_sigGenes_rare_table<-counts_rare_GH[ob_ov_nw_GH_sigGenes_list,]
+ob_ov_nw_GH_sigGenes_rare_table<-ob_ov_nw_GH_sigGenes_rare_table %>% na.omit()
+
+#set up heatmap
+colfunc <- colorRampPalette(c("white", "snow", "#ccffcc", "dodgerblue","blue", "mediumblue"))
+hmcol<-colfunc(50)
+meta_GH_ob_ov_nw_BMI <- as.data.frame(meta_GH_ob_ov_nw$Milk.fat.category)
+row.names(meta_GH_ob_ov_nw_BMI) <- row.names(meta_GH_ob_ov_nw)
+
+#make heatmap
+p<-pheatmap(ob_ov_nw_GH_sigGenes_rare_table, scale="row", color=hmcol, cluster_cols=T, cellheight = 10, annotation = meta_GH_ob_ov_nw_BMI, annotation_names_col = FALSE)
+
+#save heatmap
+save_pheatmap_pdf <- function(x, filename, width=7, height=7) {
+   stopifnot(!missing(x))
+   stopifnot(!missing(filename))
+   pdf(filename, width=width, height=height)
+   grid::grid.newpage()
+   grid::grid.draw(x$gtable)
+   dev.off()
+}
+save_pheatmap_pdf(p, "/Users/africker/Desktop/Baby_Microbes_5_24_23/cazyme_deseq_Milkfat_heatmap.pdf")
+
+```
+
+#### Matrix Correlations
+```{r}
+#Matrix correlations determine if the similarities between samples using two different datasets are the same.  For example, we calculate the similarity of samples using HMO profiles and then similarity of samples using CAZYmes. Then we compare those two similarity matrices to each other. 
+
+#remove cazymes that aren't seen more than 50 times in at least 10% of the samples. 
+physeq_rare_filt<-filter_taxa(GHs.physeq, function(x) sum(x>50) > (0.1*length(x)), TRUE)
+
+#Extract counts from phyloseq object
+counts_rare_filt<-as.data.frame(t(otu_table(physeq_rare_filt)))
+
+#Find the overlapping samples
+common.ids<-intersect(rownames(meta), rownames(counts_rare_filt))
+meta_filt<-meta[common.ids,]
+
+#This extra line makes sure the samples are in the order in the
+#metadata table and the and cazy count table.
+counts_rare_filt<-counts_rare_filt[common.ids,]
+HMO.nM.Fore<-HMO.nM.Fore[common.ids,]
+HMO.nM.Hind<-HMO.nM.Hind[common.ids,]
+HMO.ug.Fore<-HMO.ug.Fore[common.ids,]
+HMO.ug.Hind<-HMO.ug.Hind[common.ids,]
+HMO.nM.Average<-HMO.nM.Average[common.ids,]
+HMO.ug.Average<-HMO.ug.Average[common.ids,]
+
+#R can hold on to extra levels within factors, even if the samples having those levels have all been filtered away. This fixes that issue
+meta_filt<-droplevels(meta_filt)
+
+#Run distance matrix
+bray.counts_rare<-vegdist(counts_rare_filt, "bray")
+HMO.nM.Fore.Matrix<-vegdist(HMO.nM.Fore, "euclidian")
+HMO.nM.Hind.Matrix<-vegdist(HMO.nM.Hind, "euclidian")
+HMO.ug.Fore.Matrix<-vegdist(HMO.ug.Fore, "euclidian")
+HMO.ug.Hind.Matrix<-vegdist(HMO.ug.Hind, "euclidian")
+HMO.nM.Avg.Matrix<-vegdist(HMO.nM.Average, "euclidian")
+HMO.ug.Avg.Matrix<-vegdist(HMO.ug.Average, "euclidian")
+
+##Comparing data matrices: 
+#Mantel test (this is now out of favor, use MRM instead)
+vegan::mantel(bray.counts_rare, HMO.nM.Fore.Matrix, method="pearson", permutations=999)
+vegan::mantel(bray.counts_rare, HMO.nM.Hind.Matrix, method="pearson", permutations=999)
+vegan::mantel(bray.counts_rare, HMO.ug.Fore.Matrix, method="pearson", permutations=999)
+vegan::mantel(bray.counts_rare, HMO.ug.Hind.Matrix, method="pearson", permutations=999)
+vegan::mantel(bray.counts_rare, HMO.nM.Avg.Matrix, method="pearson", permutations=999)
+vegan::mantel(bray.counts_rare, HMO.ug.Avg.Matrix, method="pearson", permutations=999)
+
+#Multiple Regression on distance Matrices (MRM)
+MRM(bray.counts_rare~HMO.nM.Fore.Matrix, meta_filt)
+MRM(bray.counts_rare~HMO.nM.Hind.Matrix, meta_filt)
+MRM(bray.counts_rare~HMO.ug.Fore.Matrix, meta_filt)
+MRM(bray.counts_rare~HMO.ug.Hind.Matrix, meta_filt)
+MRM(bray.counts_rare~HMO.nM.Avg.Matrix, meta_filt)
+MRM(bray.counts_rare~HMO.ug.Avg.Matrix, meta_filt)
+```
+
+#### Redundancy Analysis
+```{r}
+#Redundancy Analysis is a constrained ordination analysis: the ordination of the 'dependent' variable (counts) is  constrained to be a function also of the other set of variables (metadata). In RDA, a simple linear multiple regression of each dependent variable on the set of independent variables is calculated and a PCA run on the fitted values. 
+
+#Select samples of interest
+types_to_keep<-c("ob.ov")
+physeq_GH_ob_ov_nw<-subset_samples(GHs.physeq, BMI.two %in% types_to_keep)
+
+#remove cazymes that aren't seen more than 50 times in at least 10% of the samples. 
+physeq_rare_filt<-filter_taxa(physeq_GH_ob_ov_nw, function(x) sum(x>50) > (0.1*length(x)), TRUE)
+
+#get the sample names so we can label the ordination plot
+sample_data(physeq_rare_filt)['sample_id']<-row.names(sample_data(physeq_rare_filt))
+
+#transform physeq to data frame
+counts_rare_filt<-as.data.frame(t(otu_table(physeq_rare_filt)))
+#Find the overlapping samples
+common.ids<-intersect(rownames(meta), rownames(counts_rare_filt))
+meta_filt<-meta[common.ids,]
+
+#Run an RDA constraining by specific variable (metadata column of choice or full metadata table)
+rda.counts_rare<-rda(counts_rare_filt~Mode.of.Delivery, data=meta_filt)
+
+#Test significance of association
+anova(rda.counts_rare, permutations=how(nperm=9999), by="terms")
+print(rda.counts_rare)
+
+#Plot RDA with the vector indicating the variable
+plot(rda.counts_rare, display=c("sp", "bp"))
+```
+
+#### CCA Analysis
+```{r}
+library(ggrepel)
+#Canonical correspondence analysis is a constrained ordination analysis: it is a weighted form of the RDA (above).  In CCA, a chi-square distances among the rows (objects) of the dependent data matrix (counts) is approximated, subject to the constraint that the canonical ordination vectors be maximally related to weighted linear combinations of the explanatory variables (metadata). 
+
+#Select samples of interest
+#types_to_keep<-c("ob.ov")
+#physeq_GH_ob_ov_nw<-subset_samples(GHs.physeq, BMI.two %in% types_to_keep)
+
+#remove cazymes that aren't seen more than 50 times in at least 10% of the samples. 
+physeq_rare_filt<-filter_taxa(GHs.physeq, function(x) sum(x>50) > (0.1*length(x)), TRUE)
+
+#get the sample names so we can label the ordination plot
+sample_data(physeq_rare_filt)['sample_id']<-row.names(sample_data(physeq_rare_filt))
+
+#transform physeq to data frame
+counts_rare_filt<-as.data.frame(t(otu_table(physeq_rare_filt)))
+#Find the overlapping samples
+common.ids<-intersect(rownames(meta), rownames(counts_rare_filt))
+meta_filt<-meta[common.ids,]
+
+#Run CCA constraining by specific variable (metadata column of choice or full metadata table)
+cca.counts_rare <- cca(counts_rare_filt ~ Mode.of.Delivery+Infantsex+Secretor, data = meta_filt)
+
+#Test significance of association
+anova(cca.counts_rare)
+print(cca.counts_rare)
+
+#Plot CCA with the vector indicating the variable
+plot(cca.counts_rare,scaling=2,type="n") #create empty graph
+points(cca.counts_rare,"sp",col="green4",pch=1,cex=.4) #add points
+#text(cca.counts_rare,display="sites",cex=1) #add sample names
+text(cca.counts_rare,display="bp",cex=.8,col="blue3") #add constraints
+
+
+veg_1 = as.data.frame(cca.counts_rare$CCA$biplot)
+veg_1["env"] = row.names(veg_1)
+
+veg_2 = as.data.frame(cca.counts_rare$CCA$v)
+veg_2["genus"] = row.names(veg_2)
+plot = ggplot() +
+  geom_point(data = veg_2, aes(x = CCA1, y = CCA2), color = "red") +
+  geom_point(data = veg_1, aes(x = CCA1, y = CCA2), color = "blue")
+
+plot +
+  # geom_text_repel(data = veg_2,aes(x = CCA1, y = CCA2, label = veg_2$genus),nudge_y = -0.05) + #for adding labels to each point
+  theme_bw() +
+  geom_segment(data = veg_1,
+    aes(x = 0, y = 0, xend = CCA1, yend = CCA2),
+    arrow = arrow(length = unit(0.25, "cm"))) +
+  geom_text_repel(data = veg_1,
+    aes(x = CCA1, y = CCA2, label = veg_1$env),
+    nudge_y = -0.05,
+    color = "blue",
+    size = 5) +
+  theme(axis.text = element_text(size = 16),
+        axis.title = element_text(size = 18))
+
+ggsave("/Users/africker/Desktop/Baby_Microbes_5_24_23/BabyMicrobes_cazy/Figures/CCA_ggplot_v1.pdf", width = 7, height = 5, dpi = 300)
+```
+
+#### EnvFit
+```{r}
+plot.a <- ordiplot(cca.counts_rare, choices=c(1,2))
+library(BiodiversityR)
+allele.envfit <- envfit(plot.a, env=meta_filt, permutations=999)
+#allele.data.envfit <- data.frame(r=allele.envfit$vectors$r, p=allele.envfit$vectors$pvals)
+scores(allele.envfit , "vectors")
+plot(allele.envfit, p.max=0.05)
+ord <- cca(counts_rare_filt ~ Mode.of.Delivery + Infantsex, meta_filt)
+plot(ord, type="p")
+fit <- envfit(ord, meta_filt, perm = 999, display = "lc")
+plot(fit, p.max = 0.05, col = "black")
+plot(ord, type = "p", scaling = "sites")
+fit <- envfit(ord, meta_filt, perm = 0, display = "lc", scaling = "sites")
+env.plot <- plot(fit, col = "black")
+
+
+
+```
+
+#### Spearman Correlation
+```{r}
+#Correlation tests look for correlations between continuous variables, such as taxa (or gene relabund) and metadata
+
+#Select samples of interest
+types_to_keep<-c("Y")
+physeq_GH_ob_ov_nw<-subset_samples(GHs_raw.physeq, Secretor %in% types_to_keep)
+
+#remove cazymes that aren't seen more than 50 times in at least 10% of the samples. 
+physeq_GH_ob_ov_nw<-filter_taxa(physeq_GH_ob_ov_nw, function(x) sum(x>50) > (0.1*length(x)), TRUE)
+
+#extract count data. 
+counts_GH_ob_ov_nw<-as.data.frame(t(otu_table(physeq_GH_ob_ov_nw)))
+
+#It is important to ensure your kegg table and metadata table samples IDs are lined up correctly. 
+#Find the overlapping samples and get just the overlapping samples.
+common.ids<-intersect(rownames(HMO.nM.Average), rownames(counts_GH_ob_ov_nw))
+counts_GH_ob_ov_nw<-counts_GH_ob_ov_nw[common.ids,]
+meta_GH_ob_ov_nw<-HMO.nM.Average[common.ids,]
+meta_GH_numeric <- meta_GH_ob_ov_nw[sapply(meta_GH_ob_ov_nw, is.numeric)]
+
+#Combine tables of interest
+data_all<-Reduce(function(x, y) merge(x, y, all=TRUE, by="rn", suffixes=c("", ".2")), 
+    lapply(list(counts_GH_ob_ov_nw, meta_GH_numeric), 
+        function(x) data.frame(x, rn = row.names(x))))
+
+
+data <- gather(data_all, GH, abund, GH1:GH98)%>%
+                     gather(meta, val, X2FL:DSLNH)
+data_nest <- group_by(data, GH, meta) %>% nest()
+
+cor_fun <- function(df) cor.test(df$abund, df$val, method = "spearman", exact=FALSE) %>% tidy()
+data_nest <- mutate(data_nest, model = map(data, cor_fun))
+corr_pr <- select(data_nest, -data) %>% unnest()
+corr_pr <- mutate(corr_pr, sig = ifelse(p.value <0.05, "Sig.", "Non Sig."))
+corr_pr_filt <- filter(corr_pr, sig == "Sig.")
+
+ggplot()+
+  geom_tile(data = corr_pr_filt,
+            aes(GH, meta, fill = estimate),
+            size = 2,
+            colour = "transparent")+
+  geom_text(data = corr_pr_filt,
+            aes(GH, meta, label = round(estimate, 1),
+            fontface = ifelse(sig == "Sig.", "bold", "plain")), 
+            size=2, 
+            angle = 90)+
+  scale_fill_gradient2(breaks = seq(-1, 1, 0.2))+
+  labs(x = "", y = "", fill = "", p.value = "")+
+  theme_minimal()+
+  theme(panel.grid.major = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        axis.ticks = element_blank(), 
+        axis.text.x = element_text(angle = 90))
+
+
+ggsave("/Users/africker/Desktop/Baby_Microbes_5_24_23/BabyMicrobes_cazy/Figures/SpearmanCorrPlot_Secretors_v1.pdf", width = 7, height = 5, dpi = 300)
+
+
+#Here is the reference:
+#https://dominicroye.github.io/en/2019/tidy-correlation-tests-in-r/
+
+
+```
+
+##OPTIONS FOR HMOS
+#SIMPER
+#> Looks at which genes are most variable

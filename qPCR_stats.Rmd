@@ -1,0 +1,190 @@
+---
+title: "KEGG Metagenome Workflow"
+author: "Rachel Mackelprang"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+
+## Load Libraries and select theming
+```{r}
+#load libraries
+# library(tidyverse) #part of phyloseq?
+# library(data.table) #rbindlist
+# library(tidyr) #collapse GHs
+library(ggplot2) #part of phyloseq?
+library(ggpubr) #add stats to plot
+# library(vegan) 
+# library(phyloseq) #using phyloseq objects
+# library(phylosmith) #barchart
+# library(microbiome) #read csv as phyloseq
+# library(DESeq2) #RNA stats package
+# library(scales) 
+# library(viridis) #Color gplots
+# library(reshape2) #melt data frame
+library(rstatix) #Calculate statistics
+library(here) #set working directory
+
+
+#some ggplot2 theming
+theme_set(theme_bw()) 
+
+```
+
+## IMPORT data
+```{r}
+#import METADATA and remove rows that are only NA
+meta<-read_tsv(here::here("Data","Metadata","MilkBabies_Map_5.txt"))
+qPCR<-read_tsv(here::here("Data","qPCRdata","Mike_Ross_Infant_Gut_Samples_qPCR_11.5.23.txt"))
+#Normalized codes the samples as 0=No/Low, 1=Yes/High/ow, 2=ob. continuous variables are normalized by taking the 
+
+#import HMO data
+HMO.nM.Fore<-read_csv(here::here("Data","MilkData","MilkBabies_HMO_nM_Fore.csv")) %>% as.data.frame() %>% column_to_rownames("SampleID")
+HMO.nM.Hind<-read_csv(here::here("Data","MilkData","MilkBabies_HMO_nM_Hind.csv")) %>% as.data.frame() %>% column_to_rownames("SampleID")
+HMO.ug.Fore<-read_csv(here::here("Data","MilkData","MilkBabies_HMO_ug_Fore.csv")) %>% as.data.frame() %>% column_to_rownames("SampleID")
+HMO.ug.Hind<-read_csv(here::here("Data","MilkData","MilkBabies_HMO_ug_Hind.csv")) %>% as.data.frame() %>% column_to_rownames("SampleID")
+
+#import TAXA 
+## this is a mock-taxa file that groups HMOs by addition - manually created
+taxa<-as.matrix(read.csv(here::here("Data","MilkData","HMO_taxtable.csv"), row.names=1))
+```
+
+## RESTRUCTURE metadata
+```{r}
+#change anything of type 'chr' to a factor. Make the first column into row names
+meta<-meta %>% as.data.frame() %>% 
+ mutate_if(sapply(meta, is.character), as.factor) %>% 
+ column_to_rownames('SampleID')
+
+qPCR<-qPCR %>% as.data.frame() %>% 
+ mutate_if(sapply(qPCR, is.character), as.factor) %>% 
+ column_to_rownames('Sample')
+names(qPCR)[names(qPCR) == "Average"] <- "qPCRAverage"
+names(qPCR)[names(qPCR) == "StDev"] <- "qPCRStDev"
+```
+
+## AVERAGE HMO data
+```{r}
+HMO.nM.Fore$sample<-rownames(HMO.nM.Fore)
+HMO.nM.Hind$sample<-rownames(HMO.nM.Hind)
+HMO.ug.Fore$sample<-rownames(HMO.ug.Fore)
+HMO.ug.Hind$sample<-rownames(HMO.ug.Hind)
+HMO.nM.Avg <- data.frame(rbindlist(list(HMO.nM.Fore,HMO.nM.Hind))[,lapply(.SD,mean), list(sample)])
+HMO.ug.Avg <- data.frame(rbindlist(list(HMO.ug.Fore,HMO.ug.Hind))[,lapply(.SD,mean), list(sample)])
+
+row.names(HMO.nM.Avg)<-HMO.nM.Avg$sample
+row.names(HMO.ug.Avg)<-HMO.ug.Avg$sample
+
+# HMO.nM.Avg<-otu_table(t(HMO.nM.Avg[,-1]), taxa_are_rows = TRUE)
+# HMO.ug.Avg<-otu_table(t(HMO.ug.Avg[,-1]), taxa_are_rows = TRUE)
+# HMO.nM.Fore <- subset(HMO.nM.Fore, select = -sample)
+# HMO.nM.Hind <- subset(HMO.nM.Hind, select = -sample)
+# HMO.ug.Fore <- subset(HMO.ug.Fore, select = -sample)
+# HMO.ug.Hind <- subset(HMO.ug.Hind, select = -sample)
+
+```
+
+
+## MERGE data
+```{r}
+#Reassign column headers
+qPCR$sample <- rownames(qPCR) 
+names(meta)[names(meta) == "SampleID2"] <- "sample"
+
+#Merge data
+alldata <- qPCR %>%
+              left_join(HMO.ug.Avg, by="sample") %>%
+              left_join(meta, by="sample")
+```
+
+
+##STATISTICAL TESTS
+### statistical tests for differences in diversity ###
+```{r}
+#MANN WHITNEY U-TEST
+#mw=wilcox.test(map$observed_species_alpha~Order)
+#mw
+#if you have *only two groups* to compare, use the Mann-Whitney U-test.
+
+#KRUSKAL-WALLIS
+#kw=kruskal.test(DevTryptone$Acetate~DonorAminFactor)
+#kw
+#if you have *more than two groups* to compare, use the Kruskal-Wallis.
+
+#ANOVA
+an=aov(alldata$qPCRAverage~alldata$BMI.x)
+summary(an)
+#if you have *more than two groups* to compare along one variable, use a one-way ANOVA
+
+#POST-HOC TUKEYS
+tukey=TukeyHSD(an)
+tukey
+#Use only after ANOVA indicates a significant difference between groups
+#THis indicates which paired comparisons caused significant ANOVA results
+#Adjust the p-values with...
+
+#DUNN TEST
+#dunn=dunn.test(DevAminoAcids$Acetate, DonorAminFactor, method='bh')
+#dunn
+#Use only after ANOVA or KW indicates a significant difference between groups
+#This indicates which paired comparisons caused significant Kruskal-Wallis results 
+#Adjust the p-values with one of the following methods: 
+#"none" (no adjustment)
+#"bonferroni" (Bonferroni adjustment)
+#“sidak” (Sidak adjustment)
+#“hs’ (Holm-Sidak adjustment)
+#“by” (Benjamini-Yekuteili adjustment)
+#“bh” (Benjamini-Hochberg procedure)
+
+#Repeat tukey's for graphing
+stat.test <- alldata %>%
+#  dplyr::group_by(RevivalYN) %>%
+  tukey_hsd(qPCRAverage ~ BMI.two.x) %>%
+  adjust_pvalue() %>%
+  add_significance("p.adj")
+stat.test
+
+stat.test <- stat.test %>% add_xy_position(x = "BMI.two.x") #add x-y position for sig bars
+
+#Format p-values
+stat.test$p.format <- p_format(
+  stat.test$p.adj, accuracy = 0.01,
+  leading.zero = FALSE) #carat for anything less than set value 
+stat.test$p.scient <- format(stat.test$p.adj, scientific = TRUE) #scientific notation
+
+```
+
+### plot significance onto BOXplots ###
+```{r}
+ggplot(alldata, aes(BMI.two.x, qPCRAverage)) +  # ggplot function
+  geom_boxplot() +
+  theme_bw() +
+  theme(axis.ticks=element_blank()) +
+  theme(panel.grid.major=element_blank()) +
+  theme(panel.grid.minor=element_blank()) +
+  scale_fill_manual(values=c("#7c7c7c",'green','purple1','orange'))+
+#  facet_grid(.~RevivalYN, scales="free", space="free") +
+  labs(title = "Bifidobacterium qPCR", 
+       subtitle = NULL, 
+       caption = NULL, 
+       tag = NULL, 
+       x = "BMI", 
+       y = "copies/ng", 
+#       y = "Concentration (mM)", 
+       color = NULL) +
+  theme(strip.text.x = element_blank(),
+        strip.background = element_rect(color="black", fill="white", linewidth=0.5, linetype="solid"), 
+        legend.position = "none") + 
+  stat_pvalue_manual(stat.test, label = "p.adj.signif", tip.length = 0, bracket.shorten = 0.1, hide.ns = FALSE)
+##makes boxplots with stats##
+```
+
+##SAVE
+### ggsave
+```{r}
+ggsave(here("Output","Figures","Boxplots","qPCR_Bifido_BMI.two_v1.pdf"), width = 5, height =5) #save most recent plot
+```
+
+```
+

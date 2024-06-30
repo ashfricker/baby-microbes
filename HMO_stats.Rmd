@@ -1,0 +1,756 @@
+---
+title: "KEGG Metagenome Workflow"
+author: "Rachel Mackelprang"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+
+# LOAD Libraries and select theming
+```{r}
+#load libraries
+library(tidyverse) #part of phyloseq?
+library(data.table) #rbindlist
+library(tidyr) #collapse GHs
+library(ggplot2) #part of phyloseq?
+library(vegan) 
+library(phyloseq) #using phyloseq objects
+library(phylosmith) #barchart
+library(microbiome) #read csv as phyloseq
+library(DESeq2) #RNA stats package
+library(scales) 
+library(viridis) #Color gplots
+library(reshape2) #melt data frame
+library(here) #set working directory
+library(ecodist) #running MRM to compare matrices
+
+#some ggplot2 theming
+theme_set(theme_bw()) 
+
+```
+
+# IMPORT data
+```{r}
+#import METADATA and remove rows that are only NA
+meta<-read_tsv(here::here("Data","Metadata","MilkBabies_Map_5.txt"))
+meta.normal<-read_tsv(here::here("Data","Metadata","MilkBabies_Map_4_normalized.txt"))
+#Normalized codes the samples as 0=No/Low, 1=Yes/High/ow, 2=ob. continuous variables are normalized by taking the 
+meta.milk<-read_tsv(here::here("Data","Metadata","MilkBabies_Map_6.txt"))
+
+#import HMO data
+HMO.nM.Fore<-read_csv(here::here("Data","MilkData","MilkBabies_HMO_nM_Fore.csv")) %>% as.data.frame() %>% column_to_rownames("SampleID")
+HMO.nM.Hind<-read_csv(here::here("Data","MilkData","MilkBabies_HMO_nM_Hind.csv")) %>% as.data.frame() %>% column_to_rownames("SampleID")
+HMO.ug.Fore<-read_csv(here::here("Data","MilkData","MilkBabies_HMO_ug_Fore.csv")) %>% as.data.frame() %>% column_to_rownames("SampleID")
+HMO.ug.Hind<-read_csv(here::here("Data","MilkData","MilkBabies_HMO_ug_Hind.csv")) %>% as.data.frame() %>% column_to_rownames("SampleID")
+
+#import TAXA 
+## this is a mock-taxa file that groups HMOs by addition - manually created
+taxa<-as.matrix(read.csv(here::here("Data","MilkData","HMO_taxtable.csv"), row.names=1))
+```
+
+# RESTRUCTURE metadata
+```{r}
+meta.normal <- meta.normal[rowSums(is.na(meta.normal)) != ncol(meta.normal), ]
+meta.normal <- meta.normal[,colSums(is.na(meta.normal))<nrow(meta.normal)]
+
+#change anything of type 'chr' to a factor. Make the first column into row names
+meta<-meta %>% as.data.frame() %>% 
+ mutate_if(sapply(meta, is.character), as.factor) %>% 
+ column_to_rownames('SampleID')
+
+meta.normal<-meta.normal %>% as.data.frame() %>% 
+ mutate_if(sapply(meta.normal, is.character), as.factor) %>% 
+ column_to_rownames('SampleID')
+
+meta.milk<-meta.milk %>% as.data.frame() %>% 
+ mutate_if(sapply(meta.milk, is.character), as.factor) %>% 
+ column_to_rownames('SampleID3')
+```
+
+# AVERAGE HMO data
+```{r}
+
+HMO.nM.Fore$sample<-rownames(HMO.nM.Fore)
+HMO.nM.Hind$sample<-rownames(HMO.nM.Hind)
+HMO.ug.Fore$sample<-rownames(HMO.ug.Fore)
+HMO.ug.Hind$sample<-rownames(HMO.ug.Hind)
+HMO.nM.Avg <- data.frame(rbindlist(list(HMO.nM.Fore,HMO.nM.Hind))[,lapply(.SD,mean), list(sample)])
+HMO.ug.Avg <- data.frame(rbindlist(list(HMO.ug.Fore,HMO.ug.Hind))[,lapply(.SD,mean), list(sample)])
+
+row.names(HMO.nM.Avg)<-HMO.nM.Avg$sample
+row.names(HMO.ug.Avg)<-HMO.ug.Avg$sample
+
+HMO.nM.Avg<-otu_table(t(HMO.nM.Avg[,-1]), taxa_are_rows = TRUE)
+HMO.ug.Avg<-otu_table(t(HMO.ug.Avg[,-1]), taxa_are_rows = TRUE)
+HMO.nM.Fore <- subset(HMO.nM.Fore, select = -sample)
+HMO.nM.Hind <- subset(HMO.nM.Hind, select = -sample)
+HMO.ug.Fore <- subset(HMO.ug.Fore, select = -sample)
+HMO.ug.Hind <- subset(HMO.ug.Hind, select = -sample)
+
+rownames(HMO.ug.Fore)= paste('Fore', rownames(HMO.ug.Fore), sep='_')
+rownames(HMO.ug.Hind)= paste('Hind', rownames(HMO.ug.Hind), sep='_')
+```
+
+# NORMALIZE HMO data
+```{r}
+HMO.nM.Rel<- HMO.nM.Avg %>% transform_sample_counts(function(x) {x/sum(x)})
+HMO.ug.Rel<-HMO.ug.Avg %>% transform_sample_counts(function(x) {x/sum(x)})
+```
+
+# NW V OB/OW
+### Create PHYLOSEQ object
+```{r}
+#CREATE PHYLOSEQ OBJECT
+physeq = phyloseq(otu_table(HMO.ug.Avg), sample_data(meta), tax_table(taxa))
+
+## HMOs with 50% abundance
+physeq.transform <- transform_sample_counts(physeq,function(x) {x/sum(x)}) #Relative abundance
+physeq.fifty <- filter_taxa(physeq.transform,function(x) sum(x)>=0.5,TRUE) #Top fifty percent
+physeq.low <- filter_taxa(physeq.transform,function(x) sum(x)<0.5,TRUE) #Bottom fifty percent
+remainder = names(sort(taxa_sums(physeq.low), TRUE)) #Get names
+
+# TOP 10 HMOs by abundance
+topten = names(sort(taxa_sums(physeq.transform), TRUE)[1:10]) #Names of top ten HMOs
+bottom = names(sort(taxa_sums(physeq.transform), FALSE)[1:9]) 
+physeq.top.ten = prune_taxa(topten, physeq) #Extract data of top ten HMOs
+
+## NORMALIZE DATA
+physeq.relabund <- relative_abundance(physeq.fifty, sig_fig=4) #normalize by relative abundance
+physeq.rel.pct <- transform_sample_counts(physeq.relabund, function(x) 100 * x) #multiply by 100 so it's a percent
+```
+
+#### GRAPH Data - Stacked Barchart
+```{r}
+library(plyr) #ddply #warning: masks here()
+library(ggh4x)
+
+## CONVERT TO DATA FRAME
+df.physeq.rel.pct = psmelt(physeq.rel.pct) #convert to data frame
+df.physeq.rel.pct$TrunAbund <- round(df.physeq.rel.pct$Abundance, 1) #Convert OTU counts to relative abundance
+df.physeq.top.ten = psmelt(physeq.top.ten) #convert to data frame
+
+df.physeq = psmelt(physeq) #convert to data frame
+df.physeq[df.physeq$OTU %in% bottom,]$OTU <- 'Other' #label low abundance (bottom 9) HMOs as "other"
+#df.physeq[df.physeq$OTU %in% remainder,]$OTU <- 'Other' #label low abundance (bottom 50%) HMOs as "other"
+df.physeq$OTU <- gsub('X2FL', '2\'-FL',
+           gsub('X3FL', '3\'-FL',
+           gsub('X3SL', '3\'-SL', 
+           gsub('X6SL', '6\'-SL', df.physeq$OTU))))
+
+#Change Facet Lables
+facet.BMI <- c("Normal Weight","Overweight/Obese")
+names(facet.BMI) <- c("normal", "ob.ov")
+facet.Secretor <- c("Non-secretor", "Secretor")
+names(facet.Secretor) <- c("N","Y")
+
+## GRAPH 
+ggplot(df.physeq, aes(x = Sample, y = Abundance, fill = reorder(OTU, Abundance))) +
+   geom_bar(position="stack",stat = "identity") + 
+  facet_nested(.~ BMI.two + Secretor, space = "free", scales = "free", labeller = labeller(BMI.two = facet.BMI, Secretor = facet.Secretor)) +
+  theme_classic() + 
+  theme (axis.text.x = element_text(angle=90, size=12), 
+         axis.text.y = element_text(size=12), 
+         axis.title.y = element_text(size=18),
+         strip.text.x = element_text(size = 10),
+         legend.text=element_text(size=12),
+         legend.title=element_text(size=16),
+        panel.grid.major = element_blank(),
+        panel.border = element_blank(),
+        panel.spacing.x  = unit(0, "mm"),
+        panel.background = element_rect(fill = NA, color = "black", linewidth = 0.5)) + 
+  labs(x=NULL, y=" Concentration (ug)", fill = "HMO") + 
+  scale_fill_brewer(palette = "Paired") + 
+  scale_y_continuous(expand = c(0,0))
+
+
+#ggsave(here::here("Output","Figures","Barcharts","HMOs_topten_other_ug_stackedbar_v2.3.pdf"), width = 15, height = 10, dpi = 300)
+```
+
+#### GRAPH Data - PCoA
+```{r}
+
+#Select samples to compare
+types_to_keep<-c("Y","N") #Change to "Y" only to compare secretors
+physeq_subset<-subset_samples(physeq, Secretor %in% types_to_keep)
+
+df.counts = as.data.frame(t(otu_table(physeq_subset))) #convert to data frame
+
+#extract samples from metadata table
+#Find the overlapping samples and get just the overlapping samples.
+common.ids<-intersect(rownames(meta), rownames(df.counts))
+
+#Order sample counts in both data frames
+meta_subset<-meta[common.ids,]
+df.counts<-df.counts[common.ids,]
+#Remove extra levels within factors (just in case)
+meta_subset<-droplevels(meta_subset)
+
+#Run distance matrix
+euclidean.counts<-vegdist(df.counts, "euclidean")
+
+# format dm, puts matrix in correct format
+distMat = as.dist(euclidean.counts)
+
+## MAKE A PCoA PLOT ##
+# note, this is the base package (not vegan) function
+pcoa_cord = data.frame(cmdscale(distMat,k=3))
+#k is the number of dimensions: you have as many dimensions as there are samples minus one. Typically, people only use the first three PCs.
+names(pcoa_cord) = c('PCoA1', 'PCoA2','PCoA3')
+
+#Combine metadata and pcoa to graph them
+meta_factor <- meta_subset[sapply(meta_subset, is.factor)] #Get columns of metadata that are factors
+pcoa_cord_meta <- merge(pcoa_cord, meta_factor, by="row.names") #Merge pcoa and metadata for graphing
+
+#Set colorblind palette
+cbbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+
+##makes PCoA plot and adjusts the aesthetics##
+ggplot(pcoa_cord_meta, aes(x=PCoA1, y=PCoA2,  shape=Secretor, color=BMI.two)) +
+  geom_point(aes(color=BMI.two), na.rm=T, size=3) +
+  stat_ellipse(data = pcoa_cord_meta, aes(x=PCoA1, y=PCoA2, group=BMI.two, color=BMI.two), type="norm", linetype=2) +
+  theme_bw() + #changes theme to black and white#
+  labs(title = "HMO", 
+       subtitle = NULL, 
+       caption = "euclidean distance", 
+       tag = NULL) + #Add stuff to the axes
+    scale_shape_manual(values=c(16,17), name = "Secretor", labels =c("No","Yes") ) + #Add color to points
+  scale_color_manual(values=c("blue","green"), name = "BMI.two", labels = c("Normal Weight", "Overweight/Obese"))+
+  theme(axis.ticks=element_blank(),#remove axis tick marks
+        plot.title=element_text(size = 20,face="bold", lineheight=0.8), #Change title font
+        axis.title = element_text(size=14),
+        axis.text = element_text(size=14),
+#        legend.position = "none", #remove the legend
+#        legend.text = element_text(size = 14), #Change legend text size
+#        legend.title = element_text(size =16, face='italic'), #Change legend title size
+        panel.grid.major=element_blank(), #remove background grid marks
+        panel.grid.minor=element_blank())+ #remove background grid marks
+  guides(fill = guide_legend(override.aes = list(shape=21)))
+
+#ggsave(here::here("Output","Figures","Ordinations","HMOs_PCoA_euclidean_v1.1.png"), width = 7, height = 5, dpi = 300)
+
+```
+
+
+### STATISTICAL TESTS
+#### PERMANOVA
+```{r}
+#NOTE: I like to be able to run the different sections of this notebook independently. So even though I performed a similarsample selection in the previous section, I regenerated it here.  
+
+#Select samples to compare
+types_to_keep<-c("Y")
+physeq_subset<-subset_samples(physeq.rel.pct, Secretor %in% types_to_keep)
+
+df.physeq = psmelt(physeq_subset) #convert to data frame
+
+#extract counts from dataframe no summing
+df.count.other <- aggregate(x = Abundance ~ OTU + Sample, 
+          data = df.physeq, 
+          FUN = sum)
+df.counts <- recast(df.count.other, OTU ~ Sample)
+rownames(df.counts) <- df.counts$OTU
+df.counts <- t(df.counts[-1])
+
+#extract samples from metadata table
+#Find the overlapping samples and get just the overlapping samples.
+common.ids<-intersect(rownames(meta), 
+rownames(df.counts))
+meta_subset<-meta[common.ids,]
+
+#This extra line makes sure the samples are in the order in the metadata table and the and cazy count table. If you don't do this, your permanova results won't be valid. 
+df.counts<-df.counts[common.ids,]
+
+#Remove extra levels within factors (just in case)
+meta_subset<-droplevels(meta_subset)
+
+##PERMANOVA
+set.seed(42)
+
+#Run distance matrix
+euclidean.counts<-vegdist(df.counts, "euclidean")
+
+#Run the PERMANOVA (adonis2) on one metadata variable
+adonis2(formula=euclidean.counts ~ BMI.two, data = meta_subset, permutations = 9999)
+
+
+##Iterate PERMANOVA through entire mapping file
+meta_subset_2cols <- names(which(lengths(lapply(meta_subset, \(x) unique(x[!is.na(x)]))) >= 2)) #Get column headers
+meta_subset_2fact<-meta_subset[,meta_subset_2cols] #Select all columns with at least two groups
+
+results<-list() #Create empty list
+for (i in colnames(meta_subset_2fact)){ 
+  form <- as.formula(paste("euclidean.counts", i, sep="~"))
+  results[[i]]<- adonis2(form, data= meta_subset_2fact, permutations=9999)
+} #loop to iterate over columns in metadata table and calculate adonis
+results
+
+#write.csv(results, here::here("Output","HMO","BabyMicrobes_HMOs_Secretors_ADONIS_v1.txt")) #Write data to file
+```
+
+#### Alpha diversity
+```{r}
+library(rstatix) #calculate statistics
+library(ggpubr) #draw boxplots
+
+#Select samples to compare
+types_to_keep<-c("Y","N")
+physeq_subset<-subset_samples(physeq, Secretor %in% types_to_keep)
+
+## NORMALIZE DATA
+physeq.relabund.sf2 <- relative_abundance(physeq_subset, sig_fig=4) #normalize by relative abundance
+physeq.rel.pct.interger <- transform_sample_counts(physeq.relabund.sf2, function(x) round(100*x, digits=0)) #multiply by 100 so it's a percent and integer
+
+
+#Set up data for significance tests. 
+alpha.rel.pct.interger <- estimate_richness(physeq.rel.pct.interger, measures=c("Observed","Shannon", "InvSimpson")) #calculate alpha diversity
+
+meta.factors <- sample_data(physeq.rel.pct.interger)[,!sapply(sample_data(physeq.rel.pct.interger), function(x) is.numeric(x))] #get columns that are only factors (remove numeric columns)
+
+df.alpha.rel.pct <- cbind(meta.factors, alpha.rel.pct.interger) #add alpha diversity to metadata
+df.alpha.rel.pct.long <- pivot_longer(df.alpha.rel.pct, cols = c("Observed","Shannon", "InvSimpson"),  names_to = "alpha", values_to = "value") #make it long format
+df.alpha.rel.pct.long$alpha_f = factor(df.alpha.rel.pct.long$alpha, levels=c("Observed","Shannon", "InvSimpson")) #add levels to reorder facets
+
+#Change labels
+facet.BMI <- c("Normal Weight","Overweight/Obese")
+names(facet.BMI) <- c("normal", "ob.ov")
+facet.Secretor <- c("Non-secretor", "Secretor")
+names(facet.Secretor) <- c("N","Y")
+
+df.alpha.rel.pct.group <- df.alpha.rel.pct.long %>% group_by(alpha_f)
+df.alpha.rel.pct.lst <- group_split(df.alpha.rel.pct.group) #create a lis of alpha diversity values
+df.alpha.rel.pct.lst <- setNames(df.alpha.rel.pct.lst, unique(df.alpha.rel.pct.group$alpha_f)) #add names to list
+
+loop_Shapiro <- lapply(df.alpha.rel.pct.lst, function(x) shapiro.test(x$value)) #loop through list to create Shapiro 
+Shapiro_res <- data.frame(do.call(rbind, loop_Shapiro)) #turn Shaprio results into data frame
+Shapiro_res
+
+#Statistical Tests for graphing
+stat.test <- df.alpha.rel.pct.long %>%
+  group_by(alpha_f) %>%
+#  t_test(value ~ BMI.two) %>% #normally distributed
+  wilcox_test(value ~ BMI.two) %>% #nonnormal
+  adjust_pvalue(method = "fdr") %>%
+  add_significance("p.adj")
+stat.test
+
+
+stat.test <- stat.test %>% add_xy_position(x = "BMI.two", scales="free_y") #add x-y position for sig bars
+
+#Format p-values
+stat.test$p.format <- p_format(
+  stat.test$p.adj, accuracy = 0.01,
+  leading.zero = FALSE) #carat for anything less than set value 
+stat.test$p.scient <- format(stat.test$p.adj, scientific = TRUE) #scientific notation
+
+#Plot alpha diversity metrics
+#THIS PLOTS IT FROM A DATA FRAME -- CAN ADD STATS
+ggplot(df.alpha.rel.pct.long) +  # ggplot function
+  geom_boxplot(aes(BMI.two, value), outlier.shape = NA) +
+  geom_point(aes(BMI.two, value), color="black") +
+  facet_wrap(.~alpha_f, scales="free")+
+  theme_classic() +
+  theme(strip.text.x = element_text(size=16),
+        strip.background = element_rect(color="black", 
+                                        fill="white", 
+                                        linewidth=1, 
+                                        linetype="solid"), 
+        axis.ticks=element_blank(), 
+        axis.text.x = element_text(size=14, angle=90), 
+        axis.text.y = element_text(size=14), 
+        axis.title = element_text(size=16), 
+        title = element_text(size=18), 
+        panel.background = element_rect(linewidth = 0.5, 
+                                        color="black", 
+                                        fill="white", 
+                                        linetype="solid"), 
+         panel.spacing.x  = unit(10, "mm")) +
+  labs(title = "HMO Alpha Diversity", 
+       subtitle = NULL, 
+       caption = NULL, 
+       tag = NULL, 
+       x = NULL, 
+       y = NULL, 
+       color = NULL) +
+  stat_pvalue_manual(stat.test, 
+                     label = "p.adj.signif", 
+                     tip.length = 0, bracket.nudge.y = 0.5,
+                     bracket.shorten = 0.1, 
+                     hide.ns = FALSE) + 
+  scale_x_discrete(labels=facet.BMI)
+
+
+ggsave(here::here("Output","Figures","Boxplots","HMOs_alpha_Secretors_boxplot_v2.pdf"), width = 10, height = 15, dpi = 300)
+```
+
+#### Differences in HMO composition
+```{r}
+#Statistics to see if specific HMOs are different: 
+#1. Run Shapiro to see if any of the HMOs are normally distributed
+#2. Run wilcox or ttest depending on those results; loop through all HMOs
+library(rstatix) #calculate statistics
+library(ggpubr) #draw boxplots
+
+#Select samples to compare
+types_to_keep<-c("Y","N")
+physeq_subset<-subset_samples(physeq, Secretor %in% types_to_keep)
+
+physeq.rel.pct.interger <- transform_sample_counts(physeq_subset, function(x) round(x, digits=0)) #multiply by 100 so it's a percent and integer
+
+df.hmo.integer <- as.data.frame(t(otu_table(physeq.rel.pct.interger))) #get data frame of HMO values
+
+meta.factors <- sample_data(physeq.rel.pct.interger)[,!sapply(sample_data(physeq.rel.pct.interger), function(x) is.numeric(x))] #get columns that are only factors (remove numeric columns)
+
+df.hmo.meta <- cbind(meta.factors, df.hmo.integer) #add alpha diversity to metadata
+
+df.hmo.meta.long <- pivot_longer(df.hmo.meta, cols = c("X2FL":"DSLNH"),  names_to = "HMO", values_to = "value") #make it long format
+
+df.hmo.meta.group <- df.hmo.meta.long %>% group_by(HMO) #group by HMOs
+
+df.hmo.meta.lst <- group_split(df.hmo.meta.group) #create a list of alpha diversity values
+df.hmo.meta.lst <- setNames(df.hmo.meta.lst, unique(df.hmo.meta.group$HMO)) #add names to list
+
+Shapiro_loop_hmo <- lapply(df.hmo.meta.lst, function(x) shapiro.test(x$value)) #loop through list to create Shapiro 
+Shapiro_res_hmo <- data.frame(do.call(rbind, Shapiro_loop_hmo)) #turn Shaprio results into data frame
+Shapiro_res_hmo
+
+#Select the HMOs that are normally distributed
+hmo.nonnormal.ids<-intersect(rownames(Shapiro_res_hmo[(Shapiro_res_hmo$p.value <= 0.05),]), df.hmo.meta.long$HMO) #Get list of HMOs where p<0.05 which is the set of non-normally distributed HMOs
+df.hmo.meta.nonn<-df.hmo.meta.long[df.hmo.meta.long$HMO %in% hmo.nonnormal.ids,]#Pull the non-normally distributed HMOs out of the data frame
+df.hmo.meta.norm<-df.hmo.meta.long[!df.hmo.meta.long$HMO %in% hmo.nonnormal.ids,]#Pull the normally distributed HMOs out of the data frame
+
+df.hmo.meta.nonn %>%
+  kruskal_test(value ~ BMI) #nonnormal global; of p<0.05, run next chunk
+
+stat.nonnormal <- df.hmo.meta.nonn %>%
+  group_by(HMO) %>%
+#  wilcox_test(value ~ BMI.two) %>% #nonnormal pair
+#  dunn_test(value ~ BMI) %>% #nonnormal >2 groups
+  adjust_pvalue(method = "fdr") %>%
+  add_significance("p.adj")
+stat.nonnormal
+
+df.hmo.meta.norm %>%
+  anova_test(value ~ BMI) #normal global; of p<0.05, run next chunk
+
+stat.normal <- df.hmo.meta.norm %>%
+  group_by(HMO) %>%
+#  t_test(value ~ BMI.two) %>% #normally distributed pair
+#  tukey_hsd(value~BMI) %>% #normally distributed >2 groups
+  adjust_pvalue(method = "fdr") %>%
+  add_significance("p.adj")
+stat.normal
+
+```
+
+
+
+#### PLDIST: Paired longitudinal distance
+```{r}
+#### *This is for making a distance matrix that takes into account longitudinal data (both fore and hind milk). Not for comparing the two. 
+library(pldist)
+
+#Convoluted way of merging the fore and hind milk samples
+HMO.ug.bind <- rbind(HMO.ug.Fore, HMO.ug.Hind)
+HMO.ug.bind <- data.frame(HMO.ug.bind, check.names = TRUE)
+
+#Convert the table to numeric
+HMO.ug.bind <- HMO.ug.bind %>%
+ mutate_if(sapply(HMO.ug.bind, is.character), as.numeric)
+
+#Make sure all samples are in both the metadata and data frame
+common.ids<-intersect(rownames(meta.milk), rownames(HMO.ug.bind))
+meta.milk<-meta.milk[common.ids,]
+HMO.ug.bind<-HMO.ug.bind[common.ids,]
+
+
+meta.milk$sampID<-rownames(meta.milk)
+meta.milk.subset<-meta.milk[,c("SampleID","sampID", "MilkSample")]
+colnames(meta.milk.subset)<-c("subjID","sampID","time")
+rownames(meta.milk.subset) <- NULL
+meta.milk.subset$time <- gsub("Fore","1",gsub("Hind","2",meta.milk.subset$time))
+
+pldist.bray.HMO.ug <- pldist(HMO.ug.bind, meta.milk.subset, paired = TRUE, method = "braycurtis")$D
+
+#Run the PERMANOVA (adonis2)
+common.ids.2<-intersect(rownames(meta), rownames(pldist.bray.HMO.ug))
+meta.2<-meta[common.ids.2,]
+
+adonis2(formula=pldist.bray.HMO.ug ~ BMI.two, data = meta.2, permutations = 9999)
+
+```
+
+# FORE VS HIND MILK
+#### Matrix comparisons
+```{r}
+HMO.ug.Fore.Matrix<-vegdist(HMO.ug.Fore, "euclidian")
+HMO.ug.Hind.Matrix<-vegdist(HMO.ug.Hind, "euclidian")
+
+common.ids<-intersect(rownames(meta), rownames(HMO.nM.Fore))
+meta_filt<-meta[common.ids,]
+
+##Comparing data matrices: 
+#Mantel test (this is now out of favor, use MRM instead)
+vegan::mantel(HMO.ug.Fore.Matrix, HMO.ug.Hind.Matrix, method="pearson", permutations=999)
+
+#Multiple Regression on distance Matrices (MRM)
+ecodist::MRM(HMO.ug.Fore.Matrix~HMO.ug.Hind.Matrix, meta_filt)
+
+```
+
+### Create PHYLOSEQ object
+```{r}
+
+#Convoluted way of merging the fore and hind milk samples
+HMO.ug.bind <- rbind(HMO.ug.Fore, HMO.ug.Hind)
+HMO.ug.bind <- data.frame(HMO.ug.bind, check.names = TRUE)
+
+#Convert the table to numeric
+HMO.ug.bind <- HMO.ug.bind %>%
+ mutate_if(sapply(HMO.ug.bind, is.character), as.numeric)
+
+#CREATE PHYLOSEQ OBJECT
+physeq.milk = phyloseq(otu_table(t(HMO.ug.bind), taxa_are_rows = TRUE), sample_data(meta.milk), tax_table(taxa))
+
+## HMOs with 50% abundance
+physeq.milk.transform <- transform_sample_counts(physeq.milk,function(x) {x/sum(x)}) #Relative abundance
+physeq.milk.fifty <- filter_taxa(physeq.milk.transform,function(x) sum(x)>=0.75,TRUE) #Top fifty percent
+physeq.milk.low <- filter_taxa(physeq.milk.transform,function(x) sum(x)<0.25,TRUE) #Bottom fifty percent
+remainder = names(sort(taxa_sums(physeq.milk.low), TRUE)) #Get names
+
+# TOP 10 HMOs by abundance
+topten.milk = names(sort(taxa_sums(physeq.milk.transform), TRUE)[1:10]) #Names of top ten HMOs
+bottom.milk = names(sort(taxa_sums(physeq.milk.transform), FALSE)[1:9]) 
+physeq.milk.top.ten = prune_taxa(topten.milk, physeq.milk) #Extract data of top ten HMOs
+
+## NORMALIZE DATA
+physeq.milk.relabund <- relative_abundance(physeq.milk.top.ten, sig_fig=4) #normalize by relative abundance
+physeq.milk.rel.pct <- transform_sample_counts(physeq.milk.relabund, function(x) 100 * x) #multiply by 100 so it's a percent
+```
+
+#### GRAPH Data - Stacked Barchart
+```{r}
+library(plyr) #ddply #warning: masks here()
+library(ggh4x)
+
+## CONVERT TO DATA FRAME
+df.physeq.milk.rel.pct = psmelt(physeq.milk.rel.pct) #convert to data frame
+df.physeq.milk.rel.pct$TrunAbund <- round(df.physeq.milk.rel.pct$Abundance, 1) #Convert OTU counts to relative abundance
+df.physeq.milk.top.ten = psmelt(physeq.milk.top.ten) #convert to data frame
+
+df.physeq.milk = psmelt(physeq.milk) #convert to data frame
+df.physeq.milk[df.physeq.milk$OTU %in% bottom.milk,]$OTU <- 'Other' #label low abundance (bottom 9) HMOs as "other"
+#df.physeq[df.physeq$OTU %in% remainder,]$OTU <- 'Other' #label low abundance (bottom 50%) HMOs as "other"
+df.physeq.milk$OTU <- gsub('X2FL', '2\'-FL',
+           gsub('X3FL', '3\'-FL',
+           gsub('X3SL', '3\'-SL', 
+           gsub('X6SL', '6\'-SL', df.physeq.milk$OTU))))
+
+#Change labels
+facet.Milk <- c("Fore Milk","Hind Milk")
+names(facet.Milk) <- c("Fore", "Hind")
+facet.Secretor <- c("Non-secretor", "Secretor")
+names(facet.Secretor) <- c("N","Y")
+facet.BMI <- c("Normal Weight","Overweight/Obese")
+names(facet.BMI) <- c("normal", "ob.ov")
+
+## GRAPH 
+ggplot(df.physeq.milk, aes(x = Sample, y = Abundance, fill = reorder(OTU, Abundance))) +
+   geom_bar(position="stack",stat = "identity") + 
+  facet_nested(.~ BMI.two + SampleID, space = "free", scales = "free", labeller = labeller(BMI.two = facet.BMI)) +
+  theme_classic() + 
+  theme (axis.text.x = element_text(angle=90, size=16), 
+         axis.text.y = element_text(size=16), 
+         axis.title.y = element_text(size=18),
+         strip.text.x = element_text(size = 14),
+         legend.text=element_text(size=16),
+         legend.title=element_text(size=16),
+        panel.grid.major = element_blank(),
+        panel.border = element_blank(),
+        panel.spacing.x  = unit(0, "mm"),
+        panel.background = element_rect(fill = NA, color = "grey", linewidth = 0.5, linetype = 2)) + 
+  labs(x=NULL, y=" Concentration (ug)", fill = "HMO") + 
+  scale_fill_brewer(palette = "Paired") + 
+  scale_y_continuous(expand = c(0,0)) + 
+  scale_x_discrete(breaks=df.physeq.milk$Sample, labels=df.physeq.milk$MilkSample)
+
+
+ggsave(here::here("Output","Figures","Barcharts","HMOs_ForeHind_topten_other_ug_stackedbar_v4.pdf"), width = 20, height = 10, dpi = 300)
+```
+
+#### PERMANOVA
+```{r}
+#NOTE: I like to be able to run the different sections of this notebook independently. So even though I performed a similarsample selection in the previous section, I regenerated it here.  
+
+#Select samples to compare
+types_to_keep<-c("Y")
+physeq_subset<-subset_samples(physeq.milk, Secretor %in% types_to_keep)
+
+df.physeq = psmelt(physeq_subset) #convert to data frame
+
+#extract counts from dataframe no summing
+df.count.other <- aggregate(x = Abundance ~ OTU + Sample, 
+          data = df.physeq, 
+          FUN = sum)
+df.counts <- recast(df.count.other, OTU ~ Sample)
+rownames(df.counts) <- df.counts$OTU
+df.counts <- t(df.counts[-1])
+
+meta.factors <- sample_data(physeq.milk)[,!sapply(sample_data(physeq.milk), function(x) is.numeric(x))] #get columns that are only factors (remove numeric columns)
+
+
+#extract samples from metadata table
+#Find the overlapping samples and get just the overlapping samples.
+common.ids<-intersect(rownames(meta.factors), 
+rownames(df.counts))
+meta_subset<-meta.factors[common.ids,]
+meta_subset <- data.frame(lapply(data.frame(meta_subset), as.character))
+
+#This extra line makes sure the samples are in the order in the metadata table and the and cazy count table. If you don't do this, your permanova results won't be valid. 
+df.counts<-df.counts[common.ids,]
+
+#Remove extra levels within factors (just in case)
+meta_subset<-droplevels(meta_subset)
+
+##PERMANOVA
+set.seed(42)
+
+#Run distance matrix
+euclidean.counts<-vegdist(df.counts, "euclidean")
+
+#Run the PERMANOVA (adonis2) on one metadata variable : Fore v Hind
+adonis2(formula=euclidean.counts ~ MilkSample, data = meta_subset, permutations = 9999)
+
+#write.csv(results, here::here("Output","HMO","BabyMicrobes_HMOs_Secretors_ADONIS_v1.txt")) #Write data to file
+```
+
+
+#### Alpha diversity
+```{r}
+library(rstatix) #calculate statistics
+library(ggpubr) #draw boxplots
+
+#Select samples to compare
+types_to_keep<-c("Y")
+physeq_subset<-subset_samples(physeq.milk, Secretor %in% types_to_keep)
+
+## NORMALIZE DATA
+physeq.relabund.sf2 <- relative_abundance(physeq.milk, sig_fig=4) #normalize by relative abundance
+physeq.rel.pct.interger <- transform_sample_counts(physeq.relabund.sf2, function(x) round(100 * x, digits=0)) #multiply by 100 so it's a percent
+
+
+#Set up data for significance tests. 
+alpha.rel.pct.interger<-estimate_richness(physeq.rel.pct.interger, measures=c("Observed","Shannon", "InvSimpson")) #calculate alpha diversity
+
+meta.factors <- sample_data(physeq.rel.pct.interger)[,!sapply(sample_data(physeq.rel.pct.interger), function(x) is.numeric(x))] #get columns that are only factors (remove numeric columns)
+
+df.alpha.rel.pct<-cbind(meta.factors, alpha.rel.pct.interger) #add alpha diversity to metadata
+df.alpha.rel.pct.long <- df.alpha.rel.pct %>%
+  tibble::rownames_to_column(var = "Row") %>%
+  pivot_longer(cols = c("Observed","Shannon", "InvSimpson"),  names_to = "alpha", values_to = "value", ) #make it long format
+df.alpha.rel.pct.long$alpha_f = factor(df.alpha.rel.pct.long$alpha, levels=c("Observed","Shannon", "InvSimpson")) #add levels to reorder facets
+
+#Change labels
+facet.Milk <- c("Fore Milk","Hind Milk")
+names(facet.Milk) <- c("Fore", "Hind")
+facet.Alpha <- c("Observed HMOs","Shannon Evenness","Inverse Simpson")
+names(facet.Alpha) <- c("Observed", "Shannon","InvSimpson")
+
+#Determine if the data is normally distributed
+df.alpha.rel.pct.uni <- df.alpha.rel.pct.long[grepl("Observed", df.alpha.rel.pct.long$alpha), ] 
+## CHANGE THIS PARAMETER! This is where you select one of the following: ("Observed", "Shannon","InvSimpson")
+
+df.alpha.rel.pct.uni %>%
+  with(value[MilkSample == "Fore"] - value[MilkSample == "Hind"]) %>%
+  shapiro_test()
+#Observed is not normally distributed; Shannon and InvSimposon are 
+
+
+#Repeat tukey's for graphing
+stat.test.Inv <- df.alpha.rel.pct.uni %>%
+  group_by(alpha_f) %>%
+  #t_test(value ~ MilkSample, paired = TRUE) %>% #normally distributed
+  wilcox_test(value ~ MilkSample, paired = TRUE) %>% #nonnormal (Observed)
+  adjust_pvalue() %>%
+  add_significance("p.adj")
+stat.test.Inv
+
+stat.test.Inv <- stat.test.Inv %>% add_xy_position(x = "MilkSample", scales="free_y") #add x-y position for sig bars
+
+#Format p-values
+stat.test.Inv$p.format <- p_format(
+  stat.test.Inv$p.adj, accuracy = 0.01,
+  leading.zero = FALSE) #carat for anything less than set value 
+stat.test.Inv$p.scient <- format(stat.test.Inv$p.adj, scientific = TRUE) #scientific notation
+
+#Plot alpha diversity metrics
+#THIS PLOTS IT FROM A DATA FRAME -- CAN ADD STATS
+ggplot(df.alpha.rel.pct.uni, aes(MilkSample, value)) +  # ggplot function
+  geom_line(aes(group = SampleID), linetype = 2, color = "grey") + 
+  geom_boxplot(aes(fill = MilkSample), alpha = 0.2) +  
+  geom_count(aes(color = MilkSample)) +
+  facet_wrap(.~alpha_f, scales="free", labeller = labeller(alpha_f = facet.Alpha)) +
+  theme_classic() +
+  theme(strip.text.x = element_text(size=16),
+        strip.background = element_rect(color="black", 
+                                        fill="white", 
+                                        linewidth=1, 
+                                        linetype="solid"), 
+        axis.ticks = element_blank(), 
+        axis.text.x = element_text(size=14, angle=90), 
+        axis.text.y = element_text(size=14), 
+        axis.title = element_text(size=16), 
+        title = element_text(size=18), 
+        panel.background = element_rect(linewidth = 0.5, 
+                                        color="black", 
+                                        fill="white", 
+                                        linetype="solid"), 
+         panel.spacing.x  = unit(10, "mm"),
+        legend.position = "right") + 
+  labs(title = NULL, 
+       subtitle = NULL, 
+       caption = "All Samples", 
+       tag = NULL, 
+       x = NULL, 
+       y = NULL, 
+       color = NULL) +
+  stat_pvalue_manual(stat.test.Inv, 
+                     label = "p.adj.signif", 
+                     tip.length = 0, 
+                     bracket.shorten = 0.1, y.position = 18.6,
+                     hide.ns = FALSE) + 
+  scale_x_discrete(labels=facet.Milk) + 
+  guides(fill = "none", color = "none") + 
+  scale_size_continuous(breaks = ~unique(round(pretty(.))), name = "Count")
+
+
+ggsave(here::here("Output","Figures","Boxplots","HMOs_All_Observed_ForeHind_boxplot_v4.pdf"), width = 5, height = 15, dpi = 300)
+```
+
+#### T-test of individual HMOs fore and hind
+```{r}
+#Convoluted way of merging the fore and hind milk samples
+HMO.ug.bind <- rbind(HMO.ug.Fore, HMO.ug.Hind)
+HMO.ug.bind <- data.frame(HMO.ug.bind, check.names = TRUE)
+
+HMO.ug.bind.long <- HMO.ug.bind %>%
+  rownames_to_column("Sample") %>%
+pivot_longer(cols=!Sample, names_to = "HMO",values_to = "Conc")
+
+HMO.ug.bind.meta <- merge(HMO.ug.bind.long, taxa, by.x="HMO",by.y='row.names')
+
+HMO.ug.bind.sum <- HMO.ug.bind.meta %>%
+  dplyr::group_by(HMO, Sample) %>%
+  dplyr::summarise(AvgConc = sum(Conc))
+
+HMO.ug.bind.sum.meta <- merge(HMO.ug.bind.sum, meta.milk, by.x="Sample",by.y='row.names')
+
+stat.test.avg.HMO <- HMO.ug.bind.sum.meta %>%
+  dplyr::group_by(HMO) %>%
+  t_test(AvgConc ~ MilkSample, paired = TRUE) %>% #normally distributed
+  #wilcox_test(value ~ MilkSample, paired = TRUE) %>% #nonnormal (Observed)
+  adjust_pvalue() %>%
+  add_significance("p.adj")
+stat.test.avg.HMO
+```
+
